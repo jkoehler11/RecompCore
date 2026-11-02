@@ -37,6 +37,19 @@ typedef struct DolPlatformOps {
     // matter to it). NULL where they do: the host then sends writes one by one.
     void (*gx_write_bytes)(const u8* bytes, u32 size);
     void (*gx_flush)(void);
+    // Where the FIFO's command stream now ends, and how far the backend's
+    // translation has parsed it, in one monotonic unit (see gx_flush). A host
+    // that takes the position where the guest is about to observe GPU progress
+    // can commit that observation when the parsed count reaches it instead of
+    // waiting for the translation to catch up. NULL where the backend keeps no
+    // such queue, or translates inline (where the position is always current).
+    u64 (*gx_position)(void);
+    u64 (*gx_parsed)(void);
+    // Take the present the translation is waiting on, if it is waiting: the
+    // guest has finished the frame and the frame is owed to the display.
+    // Never blocks; true when a present was taken. NULL where the backend
+    // never asks the host for one.
+    bool (*gx_service)(void);
     bool (*gx_read_draw_sync)(u16* token);
     void (*call_display_list)(const void* data, u32 size);
     // The same with the list's guest address, for a backend that needs to
@@ -93,6 +106,18 @@ void dol_platform_gx_write_bytes(const u8* bytes, u32 size);
 // guest is about to observe GPU progress - the draw-done commit - so the
 // translation is never behind a wait it is supposed to satisfy.
 void dol_platform_gx_flush(void);
+// The FIFO's stream position and how far the translation has parsed it, in one
+// monotonic unit. A host that must not block at a guest synchronisation point
+// records the position there and commits when the parsed count reaches it. 0
+// where the backend does not report them, which reads as "no deferral
+// possible": the caller keeps its blocking path.
+u64 dol_platform_gx_position(void);
+u64 dol_platform_gx_parsed(void);
+// Take a present the translation is waiting to have taken. The drain serves
+// this request too, so a host that stops draining at the draw-done has to
+// call this once per turn or the frame is late to its retrace. True when a
+// present was taken.
+bool dol_platform_gx_service(void);
 // Drain submitted commands and read the last decoded interrupt token.
 // False means no token was decoded or the backend cannot provide it.
 bool dol_platform_gx_read_draw_sync(u16* token);

@@ -400,6 +400,12 @@ bool g_fifo_worker_idle = true;
 bool g_fifo_worker_sleeping = false;
 std::uint64_t g_fifo_appended = 0;
 std::uint64_t g_fifo_parsed = 0;
+// g_fifo_parsed, readable without the worker's lock: the host asks how far the
+// translation has got at every turn (the draw-done overlap) and a lock there
+// would contend with every batch the worker publishes. Release on the store and
+// acquire on the read, so a host that sees a position also sees the work that
+// produced it.
+std::atomic<std::uint64_t> g_fifo_parsed_published{0};
 
 // Aurora records a frame into a packet that exists only between begin_frame and
 // end_frame, and aurora_backend_present() runs both ends in one function: the
@@ -663,6 +669,7 @@ void g_fifo_worker_main() {
         {
             std::lock_guard<std::mutex> lock(g_fifo_worker_mutex);
             g_fifo_parsed = parsed;
+            g_fifo_parsed_published.store(parsed, std::memory_order_release);
             if (!g_fifo_work_pending)
                 g_fifo_worker_idle = true;
         }
@@ -1848,6 +1855,51 @@ void aurora_backend_gx_flush(void) {
     if (!gx_aurora::g_initialized)
         return;
     gx_aurora::shadow_frontend_flush_pending();
+#endif
+}
+
+// The end of the FIFO's command stream. The thread-local batch is published
+// first: the drain does the same before it waits, so a position taken here
+// covers every byte the guest has written up to the call and the worker can
+// reach it without another write arriving.
+u64 aurora_backend_gx_position(void) {
+#if GXRUNTIME_HAS_AURORA_RECOMP
+    if (!gx_aurora::g_initialized || !gx_aurora::g_shadow_frontend_enabled ||
+        !gx_aurora::g_fifo_worker_started ||
+        gx_aurora::g_shadow_frontend_failed.load(std::memory_order_relaxed))
+        return 0u;
+    gx_aurora::g_fifo_publish_local();
+    return gx_aurora::g_fifo_appended;
+#else
+    return 0u;
+#endif
+}
+
+// How far the translation worker has parsed, and 0 when there is no worker to
+// ask (a caller treats that as "cannot defer").
+u64 aurora_backend_gx_parsed(void) {
+#if GXRUNTIME_HAS_AURORA_RECOMP
+    return gx_aurora::g_fifo_parsed_published.load(std::memory_order_acquire);
+#else
+    return 0u;
+#endif
+}
+
+// The present the worker stopped at (wait_for_present), taken without waiting.
+// Only the exchange claims the request, exactly as the guest write path does,
+// so a frame is still presented once.
+bool aurora_backend_gx_service(void) {
+#if GXRUNTIME_HAS_AURORA_RECOMP
+    if (!gx_aurora::g_initialized || !gx_aurora::g_gx_core_enabled)
+        return false;
+    if (!gx_aurora::g_display_copy_pending.load(std::memory_order_relaxed))
+        return false;
+    if (!gx_aurora::g_display_copy_pending.exchange(false))
+        return false;
+    aurora_backend_present();
+    return true;
+#else
+    return false;
 #endif
 }
 
